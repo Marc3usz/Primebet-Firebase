@@ -21,9 +21,6 @@ exports.createUser = auth.user().onCreate(async (user) => {
             creationDate: date,
         });
 
-        const tmp = userDocRef.collection("bets").doc();
-        await tmp.delete();
-
         console.log(`Użytkownik ${user.uid} został poprawnie dodany.`);
     } catch (error) {
         console.error("Błąd podczas tworzenia użytkownika:", error);
@@ -85,8 +82,15 @@ const verifyBet = (bet) => {
     const commence_time = bet.commence_time ?? false;
     const odds = bet.odds ?? false;
     const prediction = bet.prediction ?? false;
+    const name = bet.name ?? false;
     const status = "unsettled";
-    return id && home_team && away_team && commence_time && odds && prediction
+    return id &&
+        home_team &&
+        away_team &&
+        commence_time &&
+        odds &&
+        prediction &&
+        name
         ? {
               id,
               home_team,
@@ -95,6 +99,7 @@ const verifyBet = (bet) => {
               odds,
               status,
               prediction,
+              name,
           }
         : null;
 };
@@ -102,6 +107,7 @@ const verifyBet = (bet) => {
 const verifyBetslip = (betslip) => {
     const bet_amount = betslip.bet_amount ?? false;
     const games = betslip.games ?? [];
+    let newGame = []
     let errorCount = -1;
     let calculatedOdds = 1;
     for (const bet of games) {
@@ -110,13 +116,14 @@ const verifyBetslip = (betslip) => {
         if (!(verifiedBet ?? false)) errorCount++;
         if (errorCount > 0) return null;
         calculatedOdds *= verifiedBet.odds;
+        newGame = [...newGame, verifiedBet]
     }
-    return bet_amount && games
+    return bet_amount && games && (errorCount === 0)
         ? {
               status: "unsettled",
               bet_amount,
               odds: Math.floor(calculatedOdds * 100) / 100,
-              games,
+              games: newGame,
           }
         : null;
 };
@@ -127,11 +134,9 @@ exports.buyBet = functions.https.onRequest(async (req, res) => {
             const authHeader = req.headers.authorization;
 
             if (!authHeader || !authHeader.startsWith("Bearer ")) {
-                return res
-                    .status(401)
-                    .send({
-                        data: "Unauthorized request: Missing or invalid token",
-                    });
+                return res.status(401).send({
+                    data: "Unauthorized request: Missing or invalid token",
+                });
             }
 
             const bearerToken = authHeader.split("Bearer ")[1];
@@ -148,6 +153,8 @@ exports.buyBet = functions.https.onRequest(async (req, res) => {
             const userData = (await userDocRef.get()).data() ?? { credits: 0 };
             const submitted = req.body.data;
             const validated = verifyBetslip(submitted) ?? false;
+            console.log(validated)
+
 
             if (!validated) {
                 return res.status(422).send({ data: "Invalid Request" });
