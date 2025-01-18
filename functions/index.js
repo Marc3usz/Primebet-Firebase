@@ -10,15 +10,20 @@ admin.initializeApp({ credential: admin.credential.cert(KEY) });
 const firestore = admin.firestore();
 const API_KEY_ODDSAPI = require("./key/ODDSAPI_KEY.json").key;
 
-// Funkcja wywoływana przy utworzeniu nowego użytkownika
 exports.createUser = auth.user().onCreate(async (user) => {
     try {
         const date = admin.firestore.FieldValue.serverTimestamp();
-        await firestore.collection("Users").doc(user.uid).set({
+
+        const userDocRef = firestore.collection("Users").doc(user.uid);
+
+        await userDocRef.set({
             credits: 1000,
             creationDate: date,
-            bets: [],
         });
+
+        const tmp = userDocRef.collection("bets").doc();
+        await tmp.delete();
+
         console.log(`Użytkownik ${user.uid} został poprawnie dodany.`);
     } catch (error) {
         console.error("Błąd podczas tworzenia użytkownika:", error);
@@ -79,21 +84,22 @@ const verifyBet = (bet) => {
     const away_team = bet.away_team ?? false;
     const commence_time = bet.commence_time ?? false;
     const odds = bet.odds ?? false;
-    const result = bet.result ?? false;
     const prediction = bet.prediction ?? false;
-    return id &&
-        home_team &&
-        away_team &&
-        commence_time &&
-        odds &&
-        result &&
-        prediction
-        ? { id, home_team, away_team, commence_time, odds, result, prediction }
+    const status = "unsettled";
+    return id && home_team && away_team && commence_time && odds && prediction
+        ? {
+              id,
+              home_team,
+              away_team,
+              commence_time,
+              odds,
+              status,
+              prediction,
+          }
         : null;
 };
 
 const verifyBetslip = (betslip) => {
-    const status = betslip.status ?? false;
     const bet_amount = betslip.bet_amount ?? false;
     const games = betslip.games ?? [];
     let errorCount = -1;
@@ -105,11 +111,11 @@ const verifyBetslip = (betslip) => {
         if (errorCount > 0) return null;
         calculatedOdds *= verifiedBet.odds;
     }
-    return status && bet_amount && games
+    return bet_amount && games
         ? {
-              status,
+              status: "unsettled",
               bet_amount,
-              odds: Math.floor(calculatedOdds * 100)/100,
+              odds: Math.floor(calculatedOdds * 100) / 100,
               games,
           }
         : null;
@@ -119,7 +125,18 @@ exports.buyBet = functions.https.onRequest(async (req, res) => {
     corsHandler(req, res, async () => {
         try {
             const authHeader = req.headers.authorization;
-            const uid = authHeader.uid;
+
+            if (!authHeader || !authHeader.startsWith("Bearer ")) {
+                return res
+                    .status(401)
+                    .send({
+                        data: "Unauthorized request: Missing or invalid token",
+                    });
+            }
+
+            const bearerToken = authHeader.split("Bearer ")[1];
+            const decodedToken = await admin.auth().verifyIdToken(bearerToken);
+            const uid = decodedToken.uid;
 
             const userBetDocRef = db
                 .collection("Users")
@@ -128,15 +145,15 @@ exports.buyBet = functions.https.onRequest(async (req, res) => {
                 .doc();
 
             const userDocRef = db.collection("Users").doc(uid);
-            const userData = userDocRef.data() ?? { credits: 0 };
-            const submitted = req.body;
+            const userData = (await userDocRef.get()).data() ?? { credits: 0 };
+            const submitted = req.body.data;
             const validated = verifyBetslip(submitted) ?? false;
 
             if (!validated) {
-                res.status(422).send({ data: "Invalid Request" });
+                return res.status(422).send({ data: "Invalid Request" });
             } else {
-                if (validated.bet_amount >= userData.credits)
-                    res.status(422).send({ data: "Insufficient funds" });
+                if (validated.bet_amount > userData.credits)
+                    return res.status(422).send({ data: "Insufficient funds" });
 
                 const writeBatch = db.batch();
 
@@ -147,13 +164,15 @@ exports.buyBet = functions.https.onRequest(async (req, res) => {
 
                 await writeBatch.commit();
 
-                res.status(200).send({
+                return res.status(200).send({
                     data: "document successfully added",
                     id: userBetDocRef.id,
                 });
             }
         } catch (e) {
-            res.status(500).send({data: `Error occured: ${e}`})
+            console.error(e.message);
+            console.error(e.stack);
+            return res.status(500).send({ data: `Error occured: ${e}` });
         }
     });
 });
