@@ -28,3 +28,4 @@ yarn-error.log*
 /.env.*
 
 primebet-c1eed-firebase-adminsdk-qiz1l-c46dda942d.json
+ODDSAPI_KEY.json
