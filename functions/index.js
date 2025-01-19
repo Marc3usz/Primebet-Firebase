@@ -19,6 +19,12 @@ exports.createUser = auth.user().onCreate(async (user) => {
         await userDocRef.set({
             credits: 1000,
             creationDate: date,
+            wager: 0,
+            wins: 0,
+            losses: 0,
+            lost: 0,
+            won: 0,
+            luckiest_win: 0,
         });
 
         console.log(`Użytkownik ${user.uid} został poprawnie dodany.`);
@@ -132,7 +138,6 @@ exports.buyBet = functions.https.onRequest(async (req, res) => {
     corsHandler(req, res, async () => {
         try {
             const authHeader = req.headers.authorization;
-
             if (!authHeader || !authHeader.startsWith("Bearer ")) {
                 return res.status(401).send({
                     data: "Unauthorized request: Missing or invalid token",
@@ -143,15 +148,21 @@ exports.buyBet = functions.https.onRequest(async (req, res) => {
             const decodedToken = await admin.auth().verifyIdToken(bearerToken);
             const uid = decodedToken.uid;
 
+            console.log("auth ok, id: ", uid)
+
+
             const userBetDocRef = db
                 .collection("Users")
                 .doc(uid)
                 .collection("bets")
                 .doc();
 
+            console.log("getting bets collection ok")
+
             const userDocRef = db.collection("Users").doc(uid);
             const userData = (await userDocRef.get()).data() ?? { credits: 0 };
             const submitted = req.body.data;
+            console.log(submitted)
             const validated = verifyBetslip(submitted) ?? false;
             console.log(validated)
 
