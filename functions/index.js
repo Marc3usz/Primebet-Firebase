@@ -223,7 +223,7 @@ exports.buyBet = functions.https.onRequest(async (req, res) => {
     });
 });
 
-exports.scheduledGameIndexing = onSchedule("every 5 minutes", async (context) => {
+exports.scheduledGameIndexing = onSchedule("every 12 hours", async (context) => {
     console.log("Starting scheduled game indexing...");
     try {
         const betslipRef = firestore.collection("betslip_indexing");
@@ -325,68 +325,93 @@ exports.scheduledGameIndexing = onSchedule("every 5 minutes", async (context) =>
                 continue;
             }
 
-            for (const betslipDoc of betslipSnapshot.docs) {
-                const uid = betslipDoc.id; // User ID
-                const betsCollectionRef = firestore
-                    .collection("Users")
-                    .doc(uid)
-                    .collection("bets");
-    
-                const betslipsSnapshot = await betsCollectionRef.get(); // Fetch user betslips
-                if (betslipsSnapshot.empty) {
-                    console.log(`No betslips found for user ${uid}`);
-                    continue;
+            for (const betslipDoc of betslipsSnapshot.docs) {
+                const betslipData = betslipDoc.data();
+                const games = betslipData.games || [];
+
+                let allResolved = true;
+                let allWon = true;
+                let totalWinnings = 0; // Variable to accumulate the winnings
+                let betslipOdds = 1; // Variable to store the combined odds of the betslip
+
+                // Iterate through each game in the betslip
+                for (const game of games) {
+                    const gameIndexDocRef = gameIndexRef.doc(game.id);
+                    const gameIndexDoc = await gameIndexDocRef.get();
+
+                    if (!gameIndexDoc.exists) {
+                        console.log(`Game ${game.id} does not exist in game_indexing`);
+                        continue;
+                    }
+
+                    const gameIndexData = gameIndexDoc.data();
+                    if (gameIndexData.result === "pending") {
+                        allResolved = false;
+                    } else if (gameIndexData.result !== game.prediction) {
+                        allWon = false;
+                    }
+
+                    // Update the individual game's status
+                    const gameStatus =
+                        gameIndexData.result === "pending"
+                            ? "unsettled"
+                            : gameIndexData.result === game.prediction
+                            ? "won"
+                            : "lost";
+
+                    game.status = gameStatus;
+
+                    // If the game is won, accumulate the winnings
+                    if (game.status === "won") {
+                        totalWinnings += game.odds * game.amount;
+                    }
+
+                    // Calculate combined odds for the betslip
+                    betslipOdds *= game.odds;
                 }
-    
-                for (const betslipDoc of betslipsSnapshot.docs) {
-                    const betslipData = betslipDoc.data();
-                    const games = betslipData.games || [];
-    
-                    let allResolved = true;
-                    let allWon = true;
-    
-                    // Iterate through each game in the betslip
-                    for (const game of games) {
-                        const gameIndexDocRef = gameIndexRef.doc(game.id);
-                        const gameIndexDoc = await gameIndexDocRef.get();
-    
-                        if (!gameIndexDoc.exists) {
-                            console.log(`Game ${game.id} does not exist in game_indexing`);
-                            continue;
-                        }
-    
-                        const gameIndexData = gameIndexDoc.data();
-                        if (gameIndexData.result === "pending") {
-                            allResolved = false;
-                        } else if (gameIndexData.result !== game.prediction) {
-                            allWon = false;
-                        }
-    
-                        // Update the individual game's status
-                        const gameStatus =
-                            gameIndexData.result === "pending"
-                                ? "unsettled"
-                                : gameIndexData.result === game.prediction
-                                ? "won"
-                                : "lost";
-    
-                        game.status = gameStatus;
-                    }
-    
-                    // Update the betslip's status based on the game's resolutions
-                    if (allResolved) {
-                        betslipData.status = allWon ? "won" : "lost";
-                    } else {
-                        betslipData.status = "unsettled";
-                    }
-    
-                    // Save the updated betslip back to Firestore
-                    await betsCollectionRef.doc(betslipDoc.id).update(betslipData);
+
+                // Update the betslip's status based on the game's resolutions
+                if (allResolved) {
+                    betslipData.status = allWon ? "won" : "lost";
+                } else {
+                    betslipData.status = "unsettled";
+                }
+
+                // Save the updated betslip back to Firestore
+                await betsCollectionRef.doc(betslipDoc.id).update(betslipData);
+
+                // Now, update the user's stats if the betslip is settled
+                if (betslipData.status === "won") {
+                    // Add the winnings to the user's credits
+                    const userDocRef = firestore.collection("Users").doc(uid);
+                    const userData = (await userDocRef.get()).data() ?? { credits: 0, wins: 0, losses: 0, luckiest_win: 0 };
+
+                    // Update the user's credits and win count
+                    const newCredits = userData.credits + totalWinnings;
+                    const newWins = userData.wins + 1;
+
+                    // Update the user's luckiest win if applicable
+                    const newLuckiestWin = totalWinnings > userData.luckiest_win ? totalWinnings : userData.luckiest_win;
+
+                    // Update the user's document with the new values
+                    await userDocRef.update({
+                        credits: newCredits,
+                        wins: newWins,
+                        luckiest_win: newLuckiestWin,
+                    });
+                } else if (betslipData.status === "lost") {
+                    // Increment the loss count if the betslip is lost
+                    const userDocRef = firestore.collection("Users").doc(uid);
+                    const userData = (await userDocRef.get()).data() ?? { credits: 0, wins: 0, losses: 0, luckiest_win: 0 };
+                    const newLosses = userData.losses + 1;
+
+                    // Update the user's loss count
+                    await userDocRef.update({
+                        losses: newLosses,
+                    });
                 }
             }
-    
         }
-
 
         console.log("Game indexing task completed.");
         return null;
@@ -395,4 +420,5 @@ exports.scheduledGameIndexing = onSchedule("every 5 minutes", async (context) =>
         throw new functions.https.HttpsError("internal", "Game indexing failed.");
     }
 });
+
 
