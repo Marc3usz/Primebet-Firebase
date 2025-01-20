@@ -35,17 +35,22 @@ exports.createUser = auth.user().onCreate(async (user) => {
 
 const functions = require("firebase-functions");
 const axios = require("axios");
+const { onSchedule } = require("firebase-functions/scheduler");
 
 const CACHE_COLLECTION = "api_cache";
 const CACHE_TTL_MS = 3600000; // 1 hour in milliseconds
-const db = firestore;
+
+function filterUnstartedGames(games) {
+    const currentTime = new Date().toISOString();
+    return games.filter(game => new Date(game.commence_time) > new Date(currentTime));
+}
 
 exports.fetchBookmakerOdds = functions.https.onRequest(async (req, res) => {
     corsHandler(req, res, async () => {
         const endpoint = `sports/upcoming/odds/?regions=eu&markets=h2h`;
         const apiUrl = `https://api.the-odds-api.com/v4/${endpoint}&apiKey=${API_KEY_ODDSAPI}`;
 
-        const cacheDocRef = db
+        const cacheDocRef = firestore
             .collection(CACHE_COLLECTION)
             .doc(Buffer.from(endpoint).toString("base64"));
 
@@ -58,7 +63,7 @@ exports.fetchBookmakerOdds = functions.https.onRequest(async (req, res) => {
                     // Data is cached and not expired
                     return res
                         .status(200)
-                        .send({ data: cachedData.data().data });
+                        .send({ data: filterUnstartedGames(cachedData.data().data) });
                 }
             }
 
@@ -72,8 +77,8 @@ exports.fetchBookmakerOdds = functions.https.onRequest(async (req, res) => {
                 timestamp: Date.now(),
             });
 
-            // Return the data to the user
-            return res.status(200).send({ data: apiData });
+            // Return the unstarted games to the user
+            return res.status(200).send({ data: filterUnstartedGames(apiData) });
         } catch (error) {
             console.error("Error fetching or caching API data:", error);
             return res.status(500).send({ data: "Error fetching API data" });
@@ -90,13 +95,15 @@ const verifyBet = (bet) => {
     const prediction = bet.prediction ?? false;
     const name = bet.name ?? false;
     const status = "unsettled";
+    const sport_key = bet.sport_key;
     return id &&
         home_team &&
         away_team &&
         commence_time &&
         odds &&
         prediction &&
-        name
+        name &&
+        sport_key
         ? {
               id,
               home_team,
@@ -106,6 +113,7 @@ const verifyBet = (bet) => {
               status,
               prediction,
               name,
+              sport_key,
           }
         : null;
 };
@@ -113,18 +121,18 @@ const verifyBet = (bet) => {
 const verifyBetslip = (betslip) => {
     const bet_amount = betslip.bet_amount ?? false;
     const games = betslip.games ?? [];
-    let newGame = []
+    let newGame = [];
     let errorCount = -1;
     let calculatedOdds = 1;
     for (const bet of games) {
         if (errorCount == -1) errorCount++;
-        const verifiedBet = verifyBet(bet);
-        if (!(verifiedBet ?? false)) errorCount++;
+        const verifiefirestoreet = verifyBet(bet);
+        if (!(verifiefirestoreet ?? false)) errorCount++;
         if (errorCount > 0) return null;
-        calculatedOdds *= verifiedBet.odds;
-        newGame = [...newGame, verifiedBet]
+        calculatedOdds *= verifiefirestoreet.odds;
+        newGame = [...newGame, verifiefirestoreet];
     }
-    return bet_amount && games && (errorCount === 0)
+    return bet_amount && games && errorCount === 0
         ? {
               status: "unsettled",
               bet_amount,
@@ -148,24 +156,22 @@ exports.buyBet = functions.https.onRequest(async (req, res) => {
             const decodedToken = await admin.auth().verifyIdToken(bearerToken);
             const uid = decodedToken.uid;
 
-            console.log("auth ok, id: ", uid)
+            console.log("auth ok, id: ", uid);
 
-
-            const userBetDocRef = db
+            const userBetDocRef = firestore
                 .collection("Users")
                 .doc(uid)
                 .collection("bets")
                 .doc();
 
-            console.log("getting bets collection ok")
+            console.log("getting bets collection ok");
 
-            const userDocRef = db.collection("Users").doc(uid);
+            const userDocRef = firestore.collection("Users").doc(uid);
             const userData = (await userDocRef.get()).data() ?? { credits: 0 };
             const submitted = req.body.data;
-            console.log(submitted)
+            console.log(submitted);
             const validated = verifyBetslip(submitted) ?? false;
-            console.log(validated)
-
+            console.log(validated);
 
             if (!validated) {
                 return res.status(422).send({ data: "Invalid Request" });
@@ -173,24 +179,220 @@ exports.buyBet = functions.https.onRequest(async (req, res) => {
                 if (validated.bet_amount > userData.credits)
                     return res.status(422).send({ data: "Insufficient funds" });
 
-                const writeBatch = db.batch();
+                const writeBatch = firestore.batch();
 
+                // Ensure the betslip document exists
+                const betslipDocRef = firestore
+                    .collection("betslip_indexing")
+                    .doc(uid);
+
+                // Create the document if it doesn't exist (this doesn't overwrite)
+                await betslipDocRef.set({}, { merge: true });
+
+                // Reference to the 'games' subcollection in the betslip
+                const betslip_indexing = betslipDocRef.collection("games");
+
+                for (const game of validated.games) {
+                    betslip_indexing
+                        .doc(game.id)
+                        .set({ sport_key: game.sport_key }); // Add game to subcollection
+                }
+
+                // Update the user's credits and wager values
                 writeBatch.update(userDocRef, {
                     credits: userData.credits - validated.bet_amount,
+                    wager: userData.wager + validated.bet_amount,
                 });
+
+                // Set the bet details
                 writeBatch.set(userBetDocRef, validated);
 
+                // Commit the batch
                 await writeBatch.commit();
 
                 return res.status(200).send({
-                    data: "document successfully added",
+                    data: "Document successfully added",
                     id: userBetDocRef.id,
                 });
             }
         } catch (e) {
             console.error(e.message);
             console.error(e.stack);
-            return res.status(500).send({ data: `Error occured: ${e}` });
+            return res.status(500).send({ data: `Error occurred: ${e}` });
         }
     });
 });
+
+exports.scheduledGameIndexing = onSchedule("every 5 minutes", async (context) => {
+    console.log("Starting scheduled game indexing...");
+    try {
+        const betslipRef = firestore.collection("betslip_indexing");
+        const gameIndexRef = firestore.collection("game_indexing");
+
+        // Fetch all documents from betslip_indexing collection
+        const betslipSnapshot = await betslipRef.get();
+
+        if (betslipSnapshot.empty) {
+            console.log("No betslip documents found.");
+            return null;
+        }
+
+        const aggregatedSportKeys = new Set();
+
+        // Iterate over betslip documents
+        for (const betslipDoc of betslipSnapshot.docs) {
+            const uid = betslipDoc.id;
+            const gamesRef = betslipDoc.ref.collection("games");
+
+            // Fetch games from the subcollection
+            const gamesSnapshot = await gamesRef.get();
+            if (gamesSnapshot.empty) {
+                console.log(`No games found for betslip ${uid}`);
+                continue;
+            }
+
+            for (const gameDoc of gamesSnapshot.docs) {
+                const gameData = gameDoc.data();
+                const sportKey = gameData.sport_key;
+
+                if (!sportKey) {
+                    console.log(
+                        `Missing sport_key for game ${gameDoc.id} in betslip ${uid}`
+                    );
+                    continue;
+                }
+
+                aggregatedSportKeys.add(sportKey);
+
+                // Check if the document already exists in the game_indexing collection
+                const gameIndexDocRef = gameIndexRef.doc(gameDoc.id);
+                const gameIndexDoc = await gameIndexDocRef.get();
+
+                if (!gameIndexDoc.exists) {
+                    // Create the document in game_indexing
+                    await gameIndexDocRef.set({
+                        result: "pending", // Default result field
+                        sport_key: sportKey, // Include the sport_key for better querying
+                    });
+                    console.log(`Added game ${gameDoc.id} to game_indexing`);
+                } else {
+                    console.log(`Game ${gameDoc.id} already exists in game_indexing`);
+                }
+            }
+        }
+
+        // Fetch and update game results using the API
+        for (const sportKey of aggregatedSportKeys) {
+            const apiUrl = `https://api.the-odds-api.com/v4/sports/${sportKey}/scores/?daysFrom=1&apiKey=${API_KEY_ODDSAPI}`;
+            try {
+                const response = await axios.get(apiUrl);
+                const gameScores = response.data;
+
+                for (const game of gameScores) {
+                    if (game.completed) {
+                        const gameIndexDocRef = gameIndexRef.doc(game.id);
+
+                        // Determine the winner
+                        const scores = game.scores || [];
+                        const winningTeam =
+                            scores.length === 2 && scores[0].score > scores[1].score
+                                ? scores[0].name
+                                : scores[1]?.name || "draw";
+
+                        await gameIndexDocRef.update({
+                            result: winningTeam,
+                        });
+
+                        console.log(`Updated game ${game.id} with result: ${winningTeam}`);
+                    }
+                }
+            } catch (error) {
+                console.error(`Failed to fetch data for sport key ${sportKey}:`, error.message);
+            }
+        }
+
+        // NEW CODE: Iterate through each user's betslips and update their statuses
+        for (const betslipDoc of betslipSnapshot.docs) {
+            const uid = betslipDoc.id; // User ID
+            const betsCollectionRef = firestore
+                .collection("Users")
+                .doc(uid)
+                .collection("bets");
+
+            const betslipsSnapshot = await betsCollectionRef.get(); // Fetch user betslips
+            if (betslipsSnapshot.empty) {
+                console.log(`No betslips found for user ${uid}`);
+                continue;
+            }
+
+            for (const betslipDoc of betslipSnapshot.docs) {
+                const uid = betslipDoc.id; // User ID
+                const betsCollectionRef = firestore
+                    .collection("Users")
+                    .doc(uid)
+                    .collection("bets");
+    
+                const betslipsSnapshot = await betsCollectionRef.get(); // Fetch user betslips
+                if (betslipsSnapshot.empty) {
+                    console.log(`No betslips found for user ${uid}`);
+                    continue;
+                }
+    
+                for (const betslipDoc of betslipsSnapshot.docs) {
+                    const betslipData = betslipDoc.data();
+                    const games = betslipData.games || [];
+    
+                    let allResolved = true;
+                    let allWon = true;
+    
+                    // Iterate through each game in the betslip
+                    for (const game of games) {
+                        const gameIndexDocRef = gameIndexRef.doc(game.id);
+                        const gameIndexDoc = await gameIndexDocRef.get();
+    
+                        if (!gameIndexDoc.exists) {
+                            console.log(`Game ${game.id} does not exist in game_indexing`);
+                            continue;
+                        }
+    
+                        const gameIndexData = gameIndexDoc.data();
+                        if (gameIndexData.result === "pending") {
+                            allResolved = false;
+                        } else if (gameIndexData.result !== game.prediction) {
+                            allWon = false;
+                        }
+    
+                        // Update the individual game's status
+                        const gameStatus =
+                            gameIndexData.result === "pending"
+                                ? "unsettled"
+                                : gameIndexData.result === game.prediction
+                                ? "won"
+                                : "lost";
+    
+                        game.status = gameStatus;
+                    }
+    
+                    // Update the betslip's status based on the game's resolutions
+                    if (allResolved) {
+                        betslipData.status = allWon ? "won" : "lost";
+                    } else {
+                        betslipData.status = "unsettled";
+                    }
+    
+                    // Save the updated betslip back to Firestore
+                    await betsCollectionRef.doc(betslipDoc.id).update(betslipData);
+                }
+            }
+    
+        }
+
+
+        console.log("Game indexing task completed.");
+        return null;
+    } catch (error) {
+        console.error("Error in scheduledGameIndexing function:", error);
+        throw new functions.https.HttpsError("internal", "Game indexing failed.");
+    }
+});
+
